@@ -1,1 +1,113 @@
-update
+#!/usr/bin/python
+import sys
+import time
+import os
+import socket
+import hashlib
+import logging
+import logging.handlers
+import csv
+import subprocess
+import bz2
+
+def main(argv):
+   script_name = os.path.basename(__file__).split(".")[0]
+   hostname = socket.gethostname()
+   global logger
+   incrementer = 0
+   logger = logging.getLogger(script_name)
+   formatter = logging.Formatter('%(asctime)s %(threadName)s %(levelname)s: %(message)s')
+
+   # set logger stream handler to sys.stderr to show in mapred logs
+   ch = logging.StreamHandler(sys.stderr)
+   ch.setFormatter(formatter)
+   logger.addHandler(ch)
+   logger.setLevel(logging.INFO)
+
+   # Set the environment variables
+   program_name = os.environ["program_name"]
+   vendor_name = os.environ["vendor_name"]
+   odate = os.environ["odate"]
+   metadata_path = os.environ["metadata_path"]
+   check_file = os.environ["check_file"]
+   output_path = os.environ["output_path"]
+   chunk_size = int(os.environ["chunk_size"])
+   assetname_prefix = os.environ["assetname_prefix"]
+   current_working_dir = os.getcwd()
+
+   logger.info("INITIALIZING ON " + hostname + "...")
+   logger.info("PRODGRAM NAME: "+program_name)
+   logger.info("VENDOR NAME: "+vendor_name)
+   logger.info("OUTPUT PATH: "+output_path)
+   logger.info("CHUNK SIZE: "+str(chunk_size))
+   logger.info("CURRENT WORKING DIR: " +current_working_dir)
+
+   # Reads the asset path from sys.stdin
+   std_asset_file = (''.join(sys.stdin.readlines())).rstrip('\n')
+   asset_filename = str(os.path.basename(std_asset_file))
+   try:
+      subprocess.call("hadoop dfs -copyToLocal "+std_asset_file+" "+current_working_dir,shell=True)
+   except:
+      exc = sys.exc_info()[0]
+      logger.info("Exception while copying file from hdfs to working dir: "+exc)
+      sys.exit(1)
+
+   asset_filehandle = open(current_working_dir+"/"+asset_filename,"rb")
+
+   # Parse the metadata file
+   file_entry_flag = 'N'
+   try:
+      check_file = subprocess.Popen("hadoop dfs -cat "+metadata_path+"/"+check_file,stdout=subprocess.PIPE, shell=True)
+   except:
+      cat_exc = sys.exc_info()[0]
+      logger.info("Exception while reading metadata file: "+cat_exc)
+      sys.exit(1)
+
+   for line in check_file.stdout:
+     if asset_filename in line:
+         line = line.rstrip('\n')
+         logger.info("Metadata in check file: "+line)
+         row = line.split(',')
+         file_entry_flag = 'Y'
+   if file_entry_flag == 'N':
+      logger.info("No metadata found for asset: "+asset_filename)
+      logger.info("Script exit")
+      sys.exit(1)
+
+   asset_rowcount = 0
+   asset_checksum = hashlib.md5()
+ # Iterate through chunks in asset
+   decomp = bz2.BZ2Decompressor()
+   logger.info("Started Processing records in "+current_working_dir+"/"+asset_filename)
+   for chunk in iter(lambda: asset_filehandle.read(chunk_size), b''):
+       if not chunk:
+          break
+       asset_checksum.update(chunk)
+       asset_rowcount = asset_rowcount + (decomp.decompress(chunk)).count('\n')
+       logger.info("No of lines processed: "+str(asset_rowcount))
+
+   # Update final computed checksum
+   asset_checksum = asset_checksum.hexdigest()
+
+   logger.info("CALCULATED CHECKSUM: "+str(asset_checksum))
+   logger.info("CALCULATED ROWCOUNT: "+str(asset_rowcount) )
+
+   # compare the checksum and row count between metadata and asset file
+   if (str(asset_rowcount) == str(row[1])):
+       if (str(asset_checksum) == str(row[2])):
+          logger.info("Asset "+row[0]+" is good!")
+          #if asset_filename == ''
+
+          sys.stdout.write(program_name+","+vendor_name+","+assetname_prefix+(((asset_filename.split(os.extsep))[0])[:-9]).upper()+","+odate+","+str(asset_rowcount)+","+str(asset_checksum))
+          sys.stdout.write('\n')
+       else:
+          logger.info("Checksum validation on asset "+row[0]+" is failed!")
+          sys.exit(1)
+   else:
+       logger.info("Rowcount validation on asset "+row[0]+" is failed!")
+       sys.exit(1)
+
+   logger.info("Script executed sucessfully")
+
+if __name__ == "__main__":
+   main(sys.argv)
